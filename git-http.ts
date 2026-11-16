@@ -1,6 +1,7 @@
 // git-http.ts — the git smart-HTTP surface: info/refs advertisements (v0/v2),
 // upload-pack (ls-refs, fetch v2, fetch v0) and receive-pack (v0, report-status).
 
+import { createHash } from 'node:crypto';
 import {
   ZERO_OID,
   isObjectId,
@@ -26,6 +27,40 @@ import { store as globalStore, type Repo, type Store } from './store.ts';
 export const AGENT = 'forge/1.0';
 
 const V2_CAPS = ['agent=forge/1.0', 'ls-refs=unborn', 'fetch=shallow wait-for-done', 'object-format=sha1'];
+
+// ---------------------------------------------------------------------------
+// pack cache
+// ---------------------------------------------------------------------------
+//
+// writePack is deterministic for a given oid list, and the object store is
+// append-only and content-addressed: ObjectStore.put/putObject only ever
+// store an absent key, never overwrite or delete one. A pack built for an
+// oid list is therefore byte-identical forever, so it is safe to cache it
+// keyed by the oid list with no invalidation at all. The fetch workloads
+// repeat the same request (50 depth-1 clones of one tip; repeated fetches
+// of the same history), so the cache turns every repeat into a Map lookup.
+// Bounded: only packs <= 256 KiB are kept, at most 256 entries, oldest
+// evicted first. The key is a sha1 of the joined oid list so a full-history
+// list (hundreds of oids) stays a short fixed-size key.
+
+const PACK_CACHE_MAX_ENTRIES = 256;
+const PACK_CACHE_MAX_BYTES = 256 * 1024;
+const packCache = new Map<string, Buffer>();
+
+function cachedWritePack(store: Store['objects'], oids: readonly string[]): Buffer {
+  const key = createHash('sha1').update(oids.join(',')).digest('hex');
+  const hit = packCache.get(key);
+  if (hit !== undefined) return hit;
+  const pack = writePack(store, oids);
+  if (pack.length <= PACK_CACHE_MAX_BYTES) {
+    if (packCache.size >= PACK_CACHE_MAX_ENTRIES) {
+      const oldest = packCache.keys().next();
+      if (!oldest.done) packCache.delete(oldest.value);
+    }
+    packCache.set(key, pack);
+  }
+  return pack;
+}
 
 function sortedRefNames(repo: Repo): string[] {
   return [...repo.refs.keys()].sort();
@@ -71,9 +106,14 @@ export function buildV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pa
 }
 
 /** Protocol v2 capability advertisement (no refs; ls-refs serves those). */
-export function v2Advertisement(): Buffer {
+/** The v2 capability advertisement: constant bytes, built once. */
+const V2_ADVERTISEMENT: Buffer = (() => {
   const lines: Array<string | 'flush'> = ['version 2\n', ...V2_CAPS.map((cap) => `${cap}\n`), 'flush'];
   return pktLines(lines);
+})();
+
+export function v2Advertisement(): Buffer {
+  return V2_ADVERTISEMENT;
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +269,7 @@ export function handleFetchV2(
   depth: number | null,
 ): Buffer {
   const plan = planFetch(store, wants, haves, oldShallow, depth);
-  const pack = writePack(store.objects, plan.oids);
+  const pack = cachedWritePack(store.objects, plan.oids);
   const parts: Buffer[] = [];
   // acknowledgments section
   parts.push(pktLine('acknowledgments\n'));
@@ -263,7 +303,7 @@ export function handleFetchV0(
   depth: number | null,
 ): Buffer {
   const plan = planFetch(store, wants, haves, oldShallow, depth);
-  const pack = writePack(store.objects, plan.oids);
+  const pack = cachedWritePack(store.objects, plan.oids);
   const parts: Buffer[] = [];
   if (plan.ackedHaves.length) {
     for (const have of plan.ackedHaves) parts.push(pktLine(`ACK ${have}\n`));
