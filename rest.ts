@@ -232,6 +232,9 @@ function paginate<T>(items: T[], query: URLSearchParams, baseUrl: string): { pag
 export function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, body: Buffer | null): boolean {
   const method = req.method ?? 'GET';
   const segments = url.pathname.split('/').filter((s) => s.length > 0).map((s) => {
+    // Most segments carry no escapes: decoding only when one is present
+    // keeps the common path allocation-free and byte-identical.
+    if (!s.includes('%')) return s;
     try {
       return decodeURIComponent(s);
     } catch {

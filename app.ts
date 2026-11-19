@@ -38,7 +38,9 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    // One chunk is the common case (small JSON bodies, small packs):
+    // return it directly instead of copying it through Buffer.concat.
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -161,7 +163,7 @@ const GIT_ROUTE = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-rec
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
         const url = new URL(req.url ?? '/', 'http://entry');
@@ -216,4 +218,8 @@ export function createApp(): Server {
       }
     })();
   });
+  // Small request/response pairs on a keep-alive loopback connection:
+  // disable Nagle so a reply never waits for an ACK before it is sent.
+  server.on('connection', (socket) => socket.setNoDelay(true));
+  return server;
 }

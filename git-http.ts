@@ -180,8 +180,10 @@ export function planFetch(
   const included = new Set<string>();
   const seen = new Set<string>();
   const queue: string[] = [...wants];
-  while (queue.length) {
-    const oid = queue.shift() as string;
+  // Index pointer, not shift(): the walk visits every object in the
+  // wanted closure, so shift() made it quadratic on long histories.
+  for (let head = 0; head < queue.length; head += 1) {
+    const oid = queue[head] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const obj = store.objects.get(oid);
@@ -211,8 +213,8 @@ export function planFetch(
   for (const have of haves) {
     const walk: string[] = [have];
     const walked = new Set<string>();
-    while (walk.length) {
-      const oid = walk.shift() as string;
+    for (let head = 0; head < walk.length; head += 1) {
+      const oid = walk[head] as string;
       if (walked.has(oid)) continue;
       walked.add(oid);
       const obj = store.objects.get(oid);
@@ -246,16 +248,26 @@ export function planFetch(
   return { oids, shallow, unshallow, ackedHaves };
 }
 
+/** Sideband band-1 marker: one shared byte, never mutated (pktLine copies it into the frame). */
+const SIDEBAND_BAND_1 = Buffer.from([1]);
+
 function sidebandPack(pack: Buffer): Buffer {
   const parts: Buffer[] = [];
   const CHUNK = 65515;
   for (let i = 0; i < pack.length; i += CHUNK) {
     const slice = pack.subarray(i, Math.min(i + CHUNK, pack.length));
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
+    // Header + band byte + slice as separate parts: pktLine's framing
+    // is done inline here so the pack bytes are copied exactly once,
+    // by the final concat, instead of once per chunk plus once overall.
+    const header = Buffer.alloc(4);
+    header.write((slice.length + 5).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    parts.push(header, SIDEBAND_BAND_1, slice);
   }
   if (pack.length === 0) {
     // An empty pack is still sent as one sideband packet carrying the 32-byte empty pack.
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), pack])));
+    const header = Buffer.alloc(4);
+    header.write((5).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    parts.push(header, SIDEBAND_BAND_1, pack);
   }
   return Buffer.concat(parts);
 }

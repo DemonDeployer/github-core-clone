@@ -24,8 +24,9 @@ export function sha1(data: Buffer): string {
 
 /** The object id of a loose object: sha1("<type> <len>\0<data>"). */
 export function objectId(type: GitObjectType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  return sha1(Buffer.concat([header, data]));
+  // Feed the header and the body to one hash instead of concatenating
+  // first: same digest, one fewer allocation and copy per object.
+  return createHash('sha1').update(`${type} ${data.length}\0`, 'ascii').update(data).digest('hex');
 }
 
 export function isObjectId(value: string): boolean {
@@ -72,6 +73,25 @@ export interface CommitInfo {
   author: string;
   committer: string;
   message: string;
+}
+
+/** The parent oids of a commit object, read straight off the buffer: only
+ *  the header lines are converted (never the whole object, never the
+ *  message), and each `parent ` line is trimmed exactly as parseCommit
+ *  trims it, so the result is identical to parseCommit(data).parents. */
+export function commitParents(data: Buffer): string[] {
+  const parents: string[] = [];
+  let i = 0;
+  while (i < data.length) {
+    const nl = data.indexOf(0x0a, i);
+    const end = nl === -1 ? data.length : nl;
+    if (end === i) break; // blank line: end of header
+    const line = data.subarray(i, end).toString('ascii');
+    if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
+    if (nl === -1) break;
+    i = nl + 1;
+  }
+  return parents;
 }
 
 export function parseCommit(data: Buffer): CommitInfo {
@@ -189,8 +209,10 @@ export function reachable(store: ObjectStore, roots: readonly string[]): string[
   const out: string[] = [];
   const seen = new Set<string>();
   const queue: string[] = [...roots];
-  while (queue.length) {
-    const oid = queue.shift() as string;
+  // Index pointer, not shift(): shift() is O(n) per pop, so a walk over
+  // hundreds of objects was quadratic.
+  for (let head = 0; head < queue.length; head += 1) {
+    const oid = queue[head] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const obj = store.get(oid);
@@ -215,14 +237,14 @@ export function isAncestor(store: ObjectStore, ancestor: string, oid: string): b
   let current = peelToCommit(store, oid);
   const seen = new Set<string>();
   const queue: string[] = [current];
-  while (queue.length) {
-    current = queue.shift() as string;
+  for (let head = 0; head < queue.length; head += 1) {
+    current = queue[head] as string;
     if (current === target) return true;
     if (seen.has(current)) continue;
     seen.add(current);
     const obj = store.get(current);
     if (obj === undefined || obj.type !== 'commit') continue;
-    queue.push(...parseCommit(obj.data).parents);
+    queue.push(...commitParents(obj.data));
   }
   return false;
 }
@@ -237,15 +259,15 @@ export function commitGenerations(
 ): Map<string, number> {
   const generations = new Map<string, number>();
   const queue: Array<{ oid: string; depth: number }> = roots.map((oid) => ({ oid: peelToCommit(store, oid), depth: 0 }));
-  while (queue.length) {
-    const { oid, depth } = queue.shift() as { oid: string; depth: number };
+  for (let head = 0; head < queue.length; head += 1) {
+    const { oid, depth } = queue[head] as { oid: string; depth: number };
     const known = generations.get(oid);
     if (known !== undefined && known <= depth) continue;
     generations.set(oid, depth);
     if (maxDepth !== undefined && maxDepth !== null && depth >= maxDepth) continue;
     const obj = store.get(oid);
     if (obj === undefined || obj.type !== 'commit') continue;
-    for (const parent of parseCommit(obj.data).parents) queue.push({ oid: parent, depth: depth + 1 });
+    for (const parent of commitParents(obj.data)) queue.push({ oid: parent, depth: depth + 1 });
   }
   return generations;
 }
@@ -265,7 +287,9 @@ export function writePack(store: ObjectStore, oids: readonly string[]): Buffer {
   for (const oid of oids) {
     const obj = store.get(oid);
     if (obj === undefined) continue;
-    parts.push(encodePackObject(obj.type, obj.data));
+    // Header and deflated body go in as separate parts: one concat for
+    // the whole pack instead of one per object.
+    encodePackObjectParts(obj.type, obj.data, parts);
   }
   const body = Buffer.concat(parts);
   const checksum = createHash('sha1').update(body).digest();
@@ -273,6 +297,12 @@ export function writePack(store: ObjectStore, oids: readonly string[]): Buffer {
 }
 
 function encodePackObject(type: GitObjectType, data: Buffer): Buffer {
+  const parts: Buffer[] = [];
+  encodePackObjectParts(type, data, parts);
+  return Buffer.concat(parts);
+}
+
+function encodePackObjectParts(type: GitObjectType, data: Buffer, parts: Buffer[]): void {
   const typeCode = TYPE_CODES[type];
   const size = data.length;
   // First byte: (size & 0x0f) | (type << 4) | (continuation bit if more size bytes follow).
@@ -292,7 +322,7 @@ function encodePackObject(type: GitObjectType, data: Buffer): Buffer {
     if (i < headerLen - 1) byte |= 0x80;
     header[i] = byte;
   }
-  return Buffer.concat([header, deflateSync(data)]);
+  parts.push(header, deflateSync(data));
 }
 
 interface PackObjectHeader {
@@ -439,6 +469,17 @@ export function readPack(pack: Buffer): DecodedPack {
     }
   }
   // Resolve deltas (possibly chained): iterate until all resolve.
+  // `deltaUsers` is the reverse index from a placeholder to the pack
+  // offsets that chain off it, so resolving one delta updates only its
+  // dependents instead of scanning the whole offset map each time.
+  const deltaUsers = new Map<string, number[]>();
+  for (const [off, val] of offsetToOid.entries()) {
+    if (typeof val === 'string' && val.startsWith('__delta_')) {
+      const users = deltaUsers.get(val);
+      if (users === undefined) deltaUsers.set(val, [off]);
+      else users.push(off);
+    }
+  }
   const pending = new Map<number, { base: string | number; data: Buffer }>();
   deltas.forEach((delta, index) => pending.set(index, { base: delta.base, data: delta.data }));
   let progress = true;
@@ -453,8 +494,9 @@ export function readPack(pack: Buffer): DecodedPack {
       const oid = objectId(base.type, resolved);
       objects.set(oid, { type: base.type, data: resolved });
       // Any delta that used this one by offset now resolves via the offset map.
-      for (const [off, val] of offsetToOid.entries()) {
-        if (val === `__delta_${index}`) offsetToOid.set(off, oid);
+      const users = deltaUsers.get(`__delta_${index}`);
+      if (users !== undefined) {
+        for (const off of users) offsetToOid.set(off, oid);
       }
       pending.delete(index);
       progress = true;
@@ -487,11 +529,24 @@ export const pktFlush: Buffer = Buffer.from('0000', 'ascii');
 export const pktDelim: Buffer = Buffer.from('0001', 'ascii');
 
 export function pktLines(items: ReadonlyArray<string | Buffer | 'flush' | 'delim'>): Buffer {
+  // One concat for the whole frame: each line contributes its 4-byte
+  // header and its payload as separate parts instead of concatenating
+  // per line and then again for the whole.
   const parts: Buffer[] = [];
   for (const item of items) {
-    if (item === 'flush') parts.push(pktFlush);
-    else if (item === 'delim') parts.push(pktDelim);
-    else parts.push(pktLine(item));
+    if (item === 'flush') {
+      parts.push(pktFlush);
+      continue;
+    }
+    if (item === 'delim') {
+      parts.push(pktDelim);
+      continue;
+    }
+    const data = typeof item === 'string' ? Buffer.from(item, 'utf8') : item;
+    if (data.length + 4 > PKT_LINE_MAX) throw new Error('pkt-line payload too long');
+    const header = Buffer.alloc(4);
+    header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    parts.push(header, data);
   }
   return Buffer.concat(parts);
 }
@@ -504,7 +559,7 @@ export function decodePktLines(buf: Buffer): Packet[] {
   let pos = 0;
   while (pos < buf.length) {
     if (pos + 4 > buf.length) throw new Error('truncated pkt-line header');
-    const head = buf.subarray(pos, pos + 4).toString('ascii');
+    const head = buf.toString('ascii', pos, pos + 4);
     if (head === '0000') {
       packets.push({ kind: 'flush' });
       pos += 4;
@@ -535,7 +590,7 @@ export function splitReceivePackBody(buf: Buffer): { packets: Packet[]; packStar
   let pos = 0;
   const packets: Packet[] = [];
   while (pos + 4 <= buf.length) {
-    const head = buf.subarray(pos, pos + 4).toString('ascii');
+    const head = buf.toString('ascii', pos, pos + 4);
     if (head === '0000') {
       packets.push({ kind: 'flush' });
       return { packets, packStart: pos + 4 };

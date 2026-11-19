@@ -18,14 +18,17 @@ export function sendJson(
   body: unknown,
   headers: Readonly<Record<string, string>> = {},
 ): void {
-  const text = `${JSON.stringify(body)}\n`;
+  // Encode once: the byte length comes from the buffer itself, and
+  // res.end(buffer) sends it without re-encoding the string (which a
+  // res.end(string) would do as a second full pass over the body).
+  const data = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': data.length,
     'x-github-request-id': nextRequestId(),
     ...headers,
   });
-  res.end(text);
+  res.end(data);
 }
 
 export function sendError(
